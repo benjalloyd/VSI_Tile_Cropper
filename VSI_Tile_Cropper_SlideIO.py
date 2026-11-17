@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple, Union
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 
+import cv2
 import numpy as np
 
 # --- optional writers ---
@@ -31,10 +32,24 @@ except ImportError as e:
 
 
 # -----------------------
-# Types & helpers
+# Types & Configuration
 # -----------------------
 Rect = Tuple[int, int, int, int]
 Size = Tuple[int, int]
+
+
+@dataclass
+class ProjectionConfig:
+    """
+    Tunable settings for the Pseudo-RGB Z-projection.
+    Channel mapping:
+      - Red   (0): CLAHE(Best-focus single Z-plane via Laplacian variance)
+      - Green (1): CLAHE(Min intensity projection across Z)
+      - Blue  (2): CLAHE(Max intensity projection across Z)
+    """
+    clahe_clip: float = 2.5
+    clahe_grid: Tuple[int, int] = (16, 16)
+    focus_downsample_step: int = 2  # Subsample step for fast Laplacian focus scoring (1=full res, 2=2x faster)
 
 
 def _ensure_tuple2(x: Union[int, Tuple[int, int]]) -> Tuple[int, int]:
@@ -81,40 +96,121 @@ def _grid(rect: Rect, tile: Size, overlap: Size) -> Iterable[Rect]:
 
 
 # -----------------------
+# Z-Stack & Projection Helpers
+# -----------------------
+def _extract_z_slices_raw(block: np.ndarray, num_z: int) -> List[np.ndarray]:
+    """
+    Normalize SlideIO `read_block(..., slices=(0, num_z))` output into a list of
+    `num_z` 2D/3D single-plane arrays (H, W) or (H, W, C).
+    """
+    if num_z == 1:
+        if block.ndim == 4 and block.shape[-1] == 1:
+            return [np.squeeze(block, axis=-1)]
+        return [block]
+
+    # SlideIO returns (H, W, Z) for 1-channel or (H, W, C, Z) for multi-channel
+    if block.ndim == 3 and block.shape[-1] == num_z:
+        return [block[:, :, z] for z in range(num_z)]
+    if block.ndim == 4 and block.shape[-1] == num_z:
+        return [block[:, :, :, z] for z in range(num_z)]
+
+    # Fallback if Z is axis 0
+    return [block[z] for z in range(num_z)]
+
+
+def _to_grayscale_u8(plane: np.ndarray) -> np.ndarray:
+    """Convert a single Z-plane (H, W) or (H, W, C) to uint8 grayscale for projection."""
+    if plane.dtype == np.uint16:
+        arr = (plane >> 8).astype(np.uint8)
+    elif plane.dtype != np.uint8:
+        arr = np.clip(plane, 0, 255).astype(np.uint8)
+    else:
+        arr = plane
+
+    if arr.ndim == 3:
+        if arr.shape[-1] == 1:
+            return arr[:, :, 0]
+        if arr.shape[-1] == 4:
+            return cv2.cvtColor(arr, cv2.COLOR_RGBA2GRAY)
+        return cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+    return arr
+
+
+def _build_pseudo_rgb(
+    gray_planes: Sequence[np.ndarray],
+    cfg: ProjectionConfig,
+) -> np.ndarray:
+    """
+    Compute a 3-channel Pseudo-RGB uint8 image (H, W, 3) from a sequence of
+    uint8 grayscale Z-planes without allocating a 3D stack in memory.
+
+    Channels:
+      - Red   (0): CLAHE(Best single Z-plane, chosen via Laplacian variance)
+      - Green (1): CLAHE(Min intensity projection across Z)
+      - Blue  (2): CLAHE(Max intensity projection across Z)
+    """
+    p_min: Optional[np.ndarray] = None
+    p_max: Optional[np.ndarray] = None
+    best_slice: Optional[np.ndarray] = None
+    best_focus_score: float = -1.0
+
+    step = max(1, int(cfg.focus_downsample_step))
+
+    for gray in gray_planes:
+        # 1. Update running Min and Max intensity projections in-place
+        if p_min is None:
+            p_min = gray.copy()
+            p_max = gray.copy()
+        else:
+            np.minimum(p_min, gray, out=p_min)
+            np.maximum(p_max, gray, out=p_max)
+
+        # 2. Score focal sharpness using Laplacian variance on strided grid
+        sub = gray[::step, ::step] if step > 1 else gray
+        focus_score = float(cv2.Laplacian(sub, cv2.CV_16S, ksize=3).var())
+        if focus_score > best_focus_score:
+            best_focus_score = focus_score
+            best_slice = gray
+
+    # 3. Apply local contrast enhancement (CLAHE) independently per channel
+    # (Created per-call to remain 100% thread-safe across ThreadPoolExecutor workers)
+    clahe = cv2.createCLAHE(clipLimit=cfg.clahe_clip, tileGridSize=cfg.clahe_grid)
+
+    ch_red_best_z = clahe.apply(best_slice)
+    ch_green_min  = clahe.apply(p_min)
+    ch_blue_max   = clahe.apply(p_max)
+
+    return np.stack([ch_red_best_z, ch_green_min, ch_blue_max], axis=-1)
+
+
+# -----------------------
 # PNG writer
 # -----------------------
 def _write_png(
     arr: np.ndarray,
     path: Union[str, Path],
-    compress_level: int = 4,  # lossless; 0=store, 9=max compression
+    compress_level: int = 2,  # lossless; 0=store, 9=max compression
 ) -> None:
     """
     Lossless PNG writer with best-effort dtype preservation.
-    - If imageio is available (plus imagecodecs), this preserves uint16 RGB/Gray.
-    - Else Pillow: preserves uint8 RGB/Gray; preserves uint16 Gray; may downcast uint16 RGB.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
     if _HAS_IMAGEIO:
-        # imageio chooses best backend; with imagecodecs it writes 16-bit PNG cleanly
-        imageio.imwrite(path, arr, extension=".png")  # lossless by definition
+        imageio.imwrite(path, arr, extension=".png")
         return
 
     if not _HAS_PIL:
-        # last resort – NumPy (so data are not lost)
         np.save(path.with_suffix(".npy"), arr)
         return
 
-    # Pillow backend
-    # Ensure writeable contiguous
     out = np.ascontiguousarray(arr)
 
     pnginfo = PngImagePlugin.PngInfo()
     pnginfo.add_text("Software", "vsi_tiler (SlideIO)")
 
     if out.ndim == 2:
-        # Gray
         if out.dtype == np.uint16:
             im = Image.fromarray(out, mode="I;16")
         else:
@@ -123,10 +219,7 @@ def _write_png(
         return
 
     if out.ndim == 3 and out.shape[-1] in (3, 4):
-        # RGB / RGBA
         if out.dtype == np.uint16:
-            # Pillow often downcasts 16-bit RGB PNG. To avoid surprises,
-            # we right-shift to 8-bit while keeping dynamic range shape.
             out8 = (out >> 8).astype(np.uint8)
             im = Image.fromarray(out8)
         else:
@@ -134,7 +227,6 @@ def _write_png(
         im.save(path, format="PNG", pnginfo=pnginfo, compress_level=compress_level)
         return
 
-    # Otherwise, save NumPy for full fidelity
     np.save(path.with_suffix(".npy"), out)
 
 
@@ -143,11 +235,11 @@ def _write_png(
 # -----------------------
 @dataclass
 class OMEDetails:
-    calibration: Optional[float]  # micrometers per pixel (X); Y assumed same if None elsewhere
+    calibration: Optional[float]  # micrometers per pixel (X)
     calibration_unit: str
     width: int
     height: int
-    z_plane: int  # highest z index (for your schema)
+    z_plane: int  # highest z index
 
 
 @dataclass
@@ -159,14 +251,14 @@ class RunMetadata:
     processed_tile_count: int
     percent_complete: float
 
-    # Optional extras (kept out of your schema, but helpful):
     slide_name: str = ""
     scene_index: int = 0
     num_z_slices: int = 1
     channels: Optional[List[int]] = None
+    tile_naming: str = "{x}x_{y}y.png"
+    saved_individual_z_planes: bool = False
 
     def to_json(self) -> Dict:
-        # Keep your schema 100% intact; extras added at the end
         base = {
             "tile_size": self.tile_size,
             "tile_overlap": self.tile_overlap,
@@ -181,12 +273,13 @@ class RunMetadata:
             "processed_tile_count": self.processed_tile_count,
             "percent_complete": self.percent_complete,
         }
-        # Add non-breaking extras
         base.update({
             "slide_name": self.slide_name,
             "scene_index": self.scene_index,
             "num_z_slices": self.num_z_slices,
             "channels": self.channels,
+            "tile_naming": self.tile_naming,
+            "saved_individual_z_planes": self.saved_individual_z_planes,
         })
         return base
 
@@ -202,38 +295,39 @@ def crop_vsi_tiles(
     overlap: Union[int, Size] = 512,
     channels: Optional[Sequence[int]] = None,
     num_workers: Optional[int] = None,
-    png_compress_level: int = 4,  # lossless; 0 fastest/big, 9 slowest/small
+    png_compress_level: int = 2,
+    save_z_planes: bool = False,
+    projection_cfg: Optional[ProjectionConfig] = None,
 ) -> Dict:
     """
-    Tile an Olympus .vsi (including z-stacks) into PNG tiles.
-    Directory structure and JSON exactly as requested.
+    Tile an Olympus .vsi (including z-stacks) into single-plane pseudo-RGB PNG tiles
+    saved directly as `<out_root>/<slide_name>/<rx>x_<ry>y.png`
+    (R=CLAHE(Best-Z), G=CLAHE(Min), B=CLAHE(Max)).
 
-    Returns the final metadata dictionary.
+    If `save_z_planes=True`, also saves individual focal planes into `<rx>x_<ry>y/<z>z.png`.
     """
+    proj_cfg = projection_cfg or ProjectionConfig()
     vsi_path = Path(vsi_path)
     slide_name = vsi_path.stem
 
     # Open VSI
-    slide = slideio.open_slide(str(vsi_path), "VSI")  # VSI driver [1](https://www.slideio.com/sphinx/tutorial.html)
+    slide = slideio.open_slide(str(vsi_path), "VSI")
     if scene_index is None:
         scene_index = _pick_default_scene(slide)
     scene = slide.get_scene(scene_index)
 
     # Scene geometry & Z
-    x0, y0, W, H = scene.rect               # rect = (x, y, width, height) [2](https://www.slideio.com/sphinx/scene.html)
-    num_z = scene.num_z_slices              # property num_z_slices           [2](https://www.slideio.com/sphinx/scene.html)
+    x0, y0, W, H = scene.rect
+    num_z = scene.num_z_slices
 
-    # Pixel size (μm/px). Try multiple APIs depending on SlideIO version.
+    # Pixel size (μm/px)
     px_size_um = None
     try:
-        # Many bindings provide get_resolution() → (x_res_m, y_res_m)
-        rx_m, ry_m = scene.get_resolution()  # meters per pixel (x, y)  (C++ API has this) [7](https://www.slideio.com/doxygen/html/classslideio_1_1Scene.html)
+        rx_m, ry_m = scene.get_resolution()
         px_size_um = float(rx_m) * 1e6
     except Exception:
         try:
-            # Sometimes accessible via pyramid level info
-            lvl0 = scene.get_zoom_level_info(0)  # may include resolution downsamples (not strictly documented)
-            # Best effort; if missing, leave None
+            lvl0 = scene.get_zoom_level_info(0)
             rx_m = getattr(lvl0, "resolution_x", None)
             if rx_m is not None:
                 px_size_um = float(rx_m) * 1e6
@@ -255,24 +349,26 @@ def crop_vsi_tiles(
     # Channels
     channel_indices = [] if channels is None else list(channels)
 
-    # Seed metadata JSON (your schema)
+    # Seed metadata JSON
     md = RunMetadata(
-        tile_size=int(tile_size[0]),            # square per your default
+        tile_size=int(tile_size[0]),
         tile_overlap=int(overlap[0]),
         ome_metadata=OMEDetails(
             calibration=px_size_um,
             calibration_unit="µm",
             width=int(W),
             height=int(H),
-            z_plane=int(num_z - 1),            # highest z index to mirror your sample
+            z_plane=int(num_z - 1),
         ),
-        total_tile_count=xy_tile_count,         # count of (x,y) tiles, as in your sample
+        total_tile_count=xy_tile_count,
         processed_tile_count=0,
         percent_complete=0.0,
         slide_name=slide_name,
         scene_index=int(scene_index),
         num_z_slices=int(num_z),
         channels=channel_indices or None,
+        tile_naming="{x}x_{y}y.png",
+        saved_individual_z_planes=bool(save_z_planes),
     )
 
     def _flush_meta():
@@ -281,54 +377,59 @@ def crop_vsi_tiles(
 
     _flush_meta()
 
-    # Worker that writes ALL z-slices for one rect into "<slide>/<xx_x>/<z>.png"
+    # Worker that reads all Z-slices in a single call and writes `<parent_dir>/<rx>x_<ry>y.png`
     def _process_xy_tile(r: Rect):
         rx, ry, rw, rh = r
-        tile_dir = parent_dir / f"{rx}x_{ry}y"
-        tile_dir.mkdir(parents=True, exist_ok=True)
+        tile_stem = f"{rx}x_{ry}y"
 
-        # Iterate z slices (0..num_z-1). `slices=(z,z+1)` per SlideIO spec. [3](https://www.slideio.com/sphinx/functions.html)
-        for z in range(num_z):
-            arr = scene.read_block(
-                rect=(rx, ry, rw, rh),
-                size=(0, 0),  # no rescaling; use pyramid only if you decide to add it
-                channel_indices=channel_indices,
-                slices=(z, z + 1),
-            )  # Returns numpy array; z dimension size==1 for a single slice. [1](https://www.slideio.com/sphinx/tutorial.html)
+        # Single SlideIO read for the entire Z-stack
+        block = scene.read_block(
+            rect=(rx, ry, rw, rh),
+            size=(0, 0),
+            channel_indices=channel_indices,
+            slices=(0, num_z),
+        )
+        raw_planes = _extract_z_slices_raw(block, num_z)
 
-            # If reader returns an extra slice axis, squeeze it
-            if arr.ndim == 4 and arr.shape[-1] == 1:
-                arr = np.squeeze(arr, axis=-1)
+        # Optional: write individual Z-planes into a subfolder only if explicitly requested
+        if save_z_planes:
+            z_dir = parent_dir / tile_stem
+            z_dir.mkdir(parents=True, exist_ok=True)
+            for z, raw_plane in enumerate(raw_planes):
+                _write_png(raw_plane, z_dir / f"{z}z.png", compress_level=png_compress_level)
 
-            out_path = tile_dir / f"{z}z.png"
-            _write_png(arr, out_path, compress_level=png_compress_level)
+        # Build and write the Pseudo-RGB projection directly as `<parent_dir>/<rx>x_<ry>y.png`
+        gray_planes = [_to_grayscale_u8(p) for p in raw_planes]
+        pseudo_rgb = _build_pseudo_rgb(gray_planes, cfg=proj_cfg)
+        out_path = parent_dir / f"{tile_stem}.png"
+        _write_png(pseudo_rgb, out_path, compress_level=png_compress_level)
 
-        # Mark this (x,y) tile as processed
         return (rx, ry)
 
     # Threading: one job per (x,y) tile
-    max_workers = num_workers or (os.cpu_count() or 4)
+    max_workers = num_workers or min(8, os.cpu_count() or 4)
     completed = 0
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futures = [ex.submit(_process_xy_tile, r) for r in rects]
 
-        # Nice terminal progress bar that shows tile completion progress
         pbar = tqdm(total=xy_tile_count, desc=f"{slide_name} tiles", unit="tile")
         try:
             for fut in as_completed(futures):
-                _ = fut.result()  # propagate any exceptions
+                _ = fut.result()
                 completed += 1
                 md.processed_tile_count = completed
                 md.percent_complete = round(100.0 * completed / xy_tile_count, 3)
-                _flush_meta()
+                # Throttle metadata disk writes to every 25 tiles to avoid I/O bottlenecks
+                if completed % 25 == 0:
+                    _flush_meta()
                 pbar.update(1)
         finally:
             pbar.close()
 
-    # Final write
     _flush_meta()
     return md.to_json()
+
 
 # -----------------------
 # Batch helpers
@@ -361,22 +462,22 @@ def batch_crop_vsi_tiles(
     overlap: Union[int, Size] = 512,
     channels: Optional[Sequence[int]] = None,
     num_workers: Optional[int] = None,
-    png_compress_level: int = 4,
+    png_compress_level: int = 2,
+    save_z_planes: bool = False,
+    projection_cfg: Optional[ProjectionConfig] = None,
     slides_workers: int = 1,
     skip_existing: bool = False,
 ) -> List[Dict]:
     """
     Process multiple slides. Each slide's tiles go to:
-        <out_root>/<VSI_STEM>/
+        <out_root>/<VSI_STEM>/<rx>x_<ry>y.png
     Returns a list of result dicts (one per slide).
     """
-    # Normalize & de-duplicate inputs
     uniq: List[Path] = []
     seen = set()
     for inp in inputs:
         p = Path(inp)
         if p.is_dir():
-            # If a directory sneaks in here, treat it like "non-recursive" add:
             for f in sorted(p.glob("*.vsi")):
                 if f not in seen:
                     uniq.append(f); seen.add(f)
@@ -399,17 +500,18 @@ def batch_crop_vsi_tiles(
 
         md = crop_vsi_tiles(
             vsi_path=vsi_path,
-            out_root=out_root,               # IMPORTANT: crop_vsi_tiles adds <slide_name> subdir itself
+            out_root=out_root,
             scene_index=scene_index,
             tile_size=tile_size,
             overlap=overlap,
             channels=channels,
             num_workers=num_workers,
             png_compress_level=png_compress_level,
+            save_z_planes=save_z_planes,
+            projection_cfg=projection_cfg,
         )
         return {"slide": slide_name, "status": "ok", "path": str(slide_out_dir), "meta": md}
 
-    # Optional: parallelize across slides (each slide uses its own per-tile threads)
     if slides_workers and slides_workers > 1:
         with ThreadPoolExecutor(max_workers=slides_workers) as ex:
             futs = [ex.submit(_one, p) for p in uniq]
@@ -420,13 +522,12 @@ def batch_crop_vsi_tiles(
                     pbar.update(1)
             finally:
                 pbar.close()
-
     else:
         for p in tqdm(uniq, desc="Slides", unit="slide"):
             results.append(_one(p))
 
-
     return results
+
 
 # -----------------------
 # CLI (single or batch)
@@ -436,53 +537,46 @@ if __name__ == "__main__":
     import sys
 
     ap = argparse.ArgumentParser(
-        description="Tile Olympus VSI (z-stacks) into lossless PNG tiles."
+        description="Tile Olympus VSI (z-stacks) into single-plane pseudo-RGB PNG tiles (<x>x_<y>y.png)."
     )
 
-    # Mutually-exclusive input sources:
     src = ap.add_mutually_exclusive_group(required=True)
-    src.add_argument(
-        "--vsi",
-        type=str,
-        help="Path to a single .vsi file (kept backward compatible with your previous CLI).",
-    )
-    src.add_argument(
-        "--batch-dir",
-        type=str,
-        help="Process all *.vsi files found in this directory (use --recursive / --pattern for control).",
-    )
-    src.add_argument(
-        "--list",
-        type=str,
-        help="Text file with one absolute/relative .vsi path per line (blank lines and lines starting with '#' are ignored).",
-    )
+    src.add_argument("--vsi", type=str, help="Path to a single .vsi file.")
+    src.add_argument("--batch-dir", type=str, help="Process all *.vsi files in this directory.")
+    src.add_argument("--list", type=str, help="Text file with one .vsi path per line.")
 
-    ap.add_argument(
-        "out",
-        type=str,
-        help="Output root directory. Each slide will get a subfolder named after the VSI (no extension).",
-    )
+    ap.add_argument("out", type=str, help="Output root directory.")
 
-    # Tiling / reading options (shared)
+    # Tiling / reading options
     ap.add_argument("--scene", type=int, default=None, help="Scene index (default: largest scene).")
     ap.add_argument("--tile", type=int, nargs=2, default=(2048, 2048), metavar=("W", "H"))
     ap.add_argument("--overlap", type=int, nargs=2, default=(512, 512), metavar=("OX", "OY"))
-    ap.add_argument("--channels", type=int, nargs="*", default=None, help="Channel indices (default: all)")
-    ap.add_argument("--workers", type=int, default=None, help="Per-slide tile thread count (default: CPU count).")
-    ap.add_argument("--png-compress", type=int, default=4, choices=range(0, 10), help="PNG compression (0..9), lossless.")
+    ap.add_argument("--channels", type=int, nargs="*", default=None, help="Channel indices (default: all).")
+    ap.add_argument("--workers", type=int, default=None, help="Per-slide tile thread count (default: up to 8).")
+    ap.add_argument("--png-compress", type=int, default=2, choices=range(0, 10), help="PNG compression (0..9, default: 2).")
 
-    # Batch discovery / execution options
-    ap.add_argument("--pattern", type=str, default="*.vsi", help="Glob pattern when using --batch-dir (default: *.vsi).")
+    # Projection & Z-plane options
+    ap.add_argument("--save-z-planes", action="store_true", help="Also write individual <z>z.png slices into <x>x_<y>y/ subfolders (disabled by default).")
+    ap.add_argument("--clahe-clip", type=float, default=2.5, help="CLAHE clip limit (default: 2.5).")
+    ap.add_argument("--clahe-grid", type=int, nargs=2, default=(16, 16), metavar=("GX", "GY"), help="CLAHE tile grid size (default: 16 16).")
+    ap.add_argument("--focus-step", type=int, default=2, help="Downsample stride for Laplacian focus scoring (default: 2).")
+
+    # Batch options
+    ap.add_argument("--pattern", type=str, default="*.vsi", help="Glob pattern for --batch-dir (default: *.vsi).")
     ap.add_argument("--recursive", action="store_true", help="Recurse subfolders for --batch-dir.")
-    ap.add_argument("--slides-workers", type=int, default=1, help="Number of slides to process in parallel (default: 1).")
-    ap.add_argument("--skip-existing", action="store_true", help="Skip slides whose output folder already has metadata.json.")
-    ap.add_argument("--dry-run", action="store_true", help="List the slides that would be processed and exit.")
+    ap.add_argument("--slides-workers", type=int, default=1, help="Parallel slides count (default: 1).")
+    ap.add_argument("--skip-existing", action="store_true", help="Skip slides that already have metadata.json.")
+    ap.add_argument("--dry-run", action="store_true", help="List slides that would be processed and exit.")
 
     args = ap.parse_args()
 
-    # Build input list for batch mode
+    proj_cfg = ProjectionConfig(
+        clahe_clip=args.clahe_clip,
+        clahe_grid=tuple(args.clahe_grid),
+        focus_downsample_step=args.focus_step,
+    )
+
     if args.vsi:
-        # Single slide (keeps compatibility with your previous CLI)
         md = crop_vsi_tiles(
             vsi_path=args.vsi,
             out_root=args.out,
@@ -492,20 +586,15 @@ if __name__ == "__main__":
             channels=args.channels,
             num_workers=args.workers,
             png_compress_level=args.png_compress,
+            save_z_planes=args.save_z_planes,
+            projection_cfg=proj_cfg,
         )
-        # Print a small summary
         print(json.dumps(md, indent=2))
         sys.exit(0)
 
     slides: List[Path] = []
     if args.batch_dir:
-        slides.extend(
-            discover_vsi_files(
-                batch_dir=args.batch_dir,
-                pattern=args.pattern,
-                recursive=args.recursive,
-            )
-        )
+        slides.extend(discover_vsi_files(args.batch_dir, pattern=args.pattern, recursive=args.recursive))
     if args.list:
         list_file = Path(args.list)
         if not list_file.exists():
@@ -513,11 +602,9 @@ if __name__ == "__main__":
         with open(list_file, "r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                slides.append(Path(line))
+                if line and not line.startswith("#"):
+                    slides.append(Path(line))
 
-    # De-duplicate while preserving order
     seen = set()
     slides = [p for p in slides if (p not in seen and not seen.add(p))]
 
@@ -530,7 +617,6 @@ if __name__ == "__main__":
     if not slides:
         ap.error("No .vsi slides found for batch processing.")
 
-    # Run the batch
     results = batch_crop_vsi_tiles(
         inputs=slides,
         out_root=args.out,
@@ -540,11 +626,12 @@ if __name__ == "__main__":
         channels=args.channels,
         num_workers=args.workers,
         png_compress_level=args.png_compress,
+        save_z_planes=args.save_z_planes,
+        projection_cfg=proj_cfg,
         slides_workers=args.slides_workers,
         skip_existing=args.skip_existing,
     )
 
-    # Print a compact summary
     ok = sum(1 for r in results if r.get("status") == "ok")
     skipped = sum(1 for r in results if r.get("status") == "skipped")
     print(f"[DONE] Slides processed: {ok}, skipped: {skipped}, total: {len(results)}")
